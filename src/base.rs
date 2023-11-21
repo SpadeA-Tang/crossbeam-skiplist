@@ -4,8 +4,10 @@ use core::cmp;
 use core::fmt;
 use core::mem;
 use core::ops::{Deref, Index};
+use core::panic;
 use core::ptr;
 use core::sync::atomic::{fence, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use epoch::{self, Atomic, Collector, Guard, Shared};
 use scopeguard;
@@ -217,8 +219,11 @@ impl<K, V> Node<K, V> {
     /// Decrements the reference count of a node, destroying it if the count becomes zero.
     #[inline]
     unsafe fn decrement(&self, guard: &Guard) {
-        if self.refs_and_height
-            .fetch_sub(1 << HEIGHT_BITS, Ordering::Release) >> HEIGHT_BITS == 1
+        if self
+            .refs_and_height
+            .fetch_sub(1 << HEIGHT_BITS, Ordering::Release)
+            >> HEIGHT_BITS
+            == 1
         {
             fence(Ordering::Acquire);
             guard.defer(move || Self::finalize(self));
@@ -243,7 +248,7 @@ impl<K, V> Node<K, V> {
 ///
 /// The result indicates whether the key was found, as well as what were the adjacent nodes to the
 /// key on each level of the skip list.
-struct Position<'a, K: 'a, V: 'a> {
+struct Position<'a, K, V> {
     /// Reference to a node with the given key, if found.
     ///
     /// If this is `Some` then it will point to the same node as `right[0]`.
@@ -267,6 +272,95 @@ struct HotData {
     /// Highest tower currently in use. This value is used as a hint for where
     /// to start lookups and never decreases.
     max_height: AtomicUsize,
+}
+
+pub struct SkipListWrap<K, V> {
+    core: Arc<SkipList<K, V>>,
+}
+
+impl<K, V> Clone for SkipListWrap<K, V> {
+    fn clone(&self) -> Self {
+        SkipListWrap {
+            core: self.core.clone(),
+        }
+    }
+}
+
+impl<K, V> AsRef<SkipListWrap<K, V>> for SkipListWrap<K, V> {
+    fn as_ref(&self) -> &SkipListWrap<K, V> {
+        self
+    }
+}
+
+impl<K, V> SkipListWrap<K, V>
+where
+    K: Ord,
+{
+    /// Returns an entry with the specified `key`.
+    pub fn get<'g, Q>(&self, key: &Q, guard: &'g Guard) -> Option<Entry<'g, K, V>>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.core.check_guard(guard);
+        let n = self.core.search_bound(Bound::Included(key), false, guard)?;
+        if n.key.borrow() != key {
+            return None;
+        }
+        Some(Entry {
+            parent: self.clone(),
+            node: n,
+            guard,
+        })
+    }
+
+    pub fn iter<'g>(&self, guard: &'g Guard) -> IterRef<'g, SkipListWrap<K, V>, K, V> {
+        IterRef {
+            list: self.clone(),
+            cursor: None,
+        }
+    }
+}
+
+pub struct IterRef<'g, T, K, V>
+where
+    T: AsRef<SkipListWrap<K, V>>,
+{
+    list: T,
+    cursor: Option<Entry<'g, K, V>>,
+}
+
+impl<'g, K, V, T: AsRef<SkipListWrap<K, V>>> IterRef<'g, T, K, V>
+where
+    K: Ord,
+{
+    pub fn valid(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    pub fn key(&self) -> &K {
+        assert!(self.valid());
+        self.cursor.as_ref().unwrap().key()
+    }
+
+    pub fn value(&self) -> &V {
+        assert!(self.valid());
+        self.cursor.as_ref().unwrap().value()
+    }
+
+    pub fn next(&mut self) {
+        assert!(self.valid());
+        let next = self.cursor.as_ref().unwrap().next();
+        self.cursor = next;
+    }
+
+    pub fn prev(&mut self) {
+        assert!(self.valid());
+        let next = self.cursor.as_ref().unwrap().prev();
+        self.cursor = next;
+    }
+
+    pub fn seek(&mut self, target: &[u8]) {}
 }
 
 /// A lock-free skip list.
@@ -344,165 +438,6 @@ impl<K, V> SkipList<K, V>
 where
     K: Ord,
 {
-    /// Returns the entry with the smallest key.
-    pub fn front<'a: 'g, 'g>(&'a self, guard: &'g Guard) -> Option<Entry<'a, 'g, K, V>> {
-        self.check_guard(guard);
-        let n = self.next_node(&self.head, Bound::Unbounded, guard)?;
-        Some(Entry {
-            parent: self,
-            node: n,
-            guard,
-        })
-    }
-
-    /// Returns the entry with the largest key.
-    pub fn back<'a: 'g, 'g>(&'a self, guard: &'g Guard) -> Option<Entry<'a, 'g, K, V>> {
-        self.check_guard(guard);
-        let n = self.search_bound(Bound::Unbounded, true, guard)?;
-        Some(Entry {
-            parent: self,
-            node: n,
-            guard,
-        })
-    }
-
-    /// Returns `true` if the map contains a value for the specified key.
-    pub fn contains_key<Q>(&self, key: &Q, guard: &Guard) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        self.get(key, guard).is_some()
-    }
-
-    /// Returns an entry with the specified `key`.
-    pub fn get<'a: 'g, 'g, Q>(&'a self, key: &Q, guard: &'g Guard) -> Option<Entry<'a, 'g, K, V>>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        self.check_guard(guard);
-        let n = self.search_bound(Bound::Included(key), false, guard)?;
-        if n.key.borrow() != key {
-            return None;
-        }
-        Some(Entry {
-            parent: self,
-            node: n,
-            guard,
-        })
-    }
-
-    /// Returns an `Entry` pointing to the lowest element whose key is above
-    /// the given bound. If no such element is found then `None` is
-    /// returned.
-    pub fn lower_bound<'a: 'g, 'g, Q>(
-        &'a self,
-        bound: Bound<&Q>,
-        guard: &'g Guard,
-    ) -> Option<Entry<'a, 'g, K, V>>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        self.check_guard(guard);
-        let n = self.search_bound(bound, false, guard)?;
-        Some(Entry {
-            parent: self,
-            node: n,
-            guard,
-        })
-    }
-
-    /// Returns an `Entry` pointing to the highest element whose key is below
-    /// the given bound. If no such element is found then `None` is
-    /// returned.
-    pub fn upper_bound<'a: 'g, 'g, Q>(
-        &'a self,
-        bound: Bound<&Q>,
-        guard: &'g Guard,
-    ) -> Option<Entry<'a, 'g, K, V>>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        self.check_guard(guard);
-        let n = self.search_bound(bound, true, guard)?;
-        Some(Entry {
-            parent: self,
-            node: n,
-            guard,
-        })
-    }
-
-    /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist.
-    pub fn get_or_insert(&self, key: K, value: V, guard: &Guard) -> RefEntry<K, V> {
-        self.insert_internal(key, value, false, guard)
-    }
-
-    /// Returns an iterator over all entries in the skip list.
-    pub fn iter<'a: 'g, 'g>(&'a self, guard: &'g Guard) -> Iter<'a, 'g, K, V> {
-        self.check_guard(guard);
-        Iter {
-            parent: self,
-            head: None,
-            tail: None,
-            guard,
-        }
-    }
-
-    /// Returns an iterator over all entries in the skip list.
-    pub fn ref_iter(&self) -> RefIter<K, V> {
-        RefIter {
-            parent: self,
-            head: None,
-            tail: None,
-        }
-    }
-
-    /// Returns an iterator over a subset of entries in the skip list.
-    pub fn range<'a: 'g, 'g, 'k, Min, Max>(
-        &'a self,
-        lower_bound: Bound<&'k Min>,
-        upper_bound: Bound<&'k Max>,
-        guard: &'g Guard,
-    ) -> Range<'a, 'g, 'k, Min, Max, K, V>
-    where
-        K: Ord + Borrow<Min> + Borrow<Max>,
-        Min: Ord + ?Sized + 'k,
-        Max: Ord + ?Sized + 'k,
-    {
-        self.check_guard(guard);
-        Range {
-            parent: self,
-            head: None,
-            tail: None,
-            lower_bound,
-            upper_bound,
-            guard,
-        }
-    }
-
-    /// Returns an iterator over a subset of entries in the skip list.
-    pub fn ref_range<'a, 'k, Min, Max>(
-        &'a self,
-        lower_bound: Bound<&'k Min>,
-        upper_bound: Bound<&'k Max>,
-    ) -> RefRange<'a, 'k, Min, Max, K, V>
-    where
-        K: Ord + Borrow<Min> + Borrow<Max>,
-        Min: Ord + ?Sized + 'k,
-        Max: Ord + ?Sized + 'k,
-    {
-        RefRange {
-            parent: self,
-            head: None,
-            tail: None,
-            lower_bound,
-            upper_bound,
-        }
-    }
-
     /// Generates a random height and returns it.
     fn random_height(&self) -> usize {
         // Pseudorandom number generation from "Xorshift RNGs" by George Marsaglia.
@@ -1010,6 +945,195 @@ where
     }
 }
 
+impl<K, V> SkipListWrap<K, V>
+where
+    K: Ord,
+{
+    /// Returns the entry with the smallest key.
+    pub fn front<'g>(&self, guard: &'g Guard) -> Option<Entry<'g, K, V>> {
+        self.core.check_guard(guard);
+        let n = self
+            .core
+            .next_node(&self.core.head, Bound::Unbounded, guard)?;
+        Some(Entry {
+            parent: self.clone(),
+            node: n,
+            guard,
+        })
+    }
+
+    /// Returns the entry with the largest key.
+    pub fn back<'g>(&self, guard: &'g Guard) -> Option<Entry<'g, K, V>> {
+        self.core.check_guard(guard);
+        let n = self.core.search_bound(Bound::Unbounded, true, guard)?;
+        Some(Entry {
+            parent: self.clone(),
+            node: n,
+            guard,
+        })
+    }
+
+    /// Returns `true` if the map contains a value for the specified key.
+    pub fn contains_key<Q>(&self, key: &Q, guard: &Guard) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.get(key, guard).is_some()
+    }
+
+    /// Returns an `Entry` pointing to the lowest element whose key is above
+    /// the given bound. If no such element is found then `None` is
+    /// returned.
+    pub fn lower_bound<'g, Q>(&self, bound: Bound<&Q>, guard: &'g Guard) -> Option<Entry<'g, K, V>>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.core.check_guard(guard);
+        let n = self.core.search_bound(bound, false, guard)?;
+        Some(Entry {
+            parent: SkipListWrap::clone(&self),
+            node: n,
+            guard,
+        })
+    }
+
+    /// Returns an `Entry` pointing to the highest element whose key is below
+    /// the given bound. If no such element is found then `None` is
+    /// returned.
+    pub fn upper_bound<'g, Q>(&self, bound: Bound<&Q>, guard: &'g Guard) -> Option<Entry<'g, K, V>>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.core.check_guard(guard);
+        let n = self.core.search_bound(bound, true, guard)?;
+        Some(Entry {
+            parent: self.clone(),
+            node: n,
+            guard,
+        })
+    }
+
+    /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist.
+    pub fn get_or_insert(&self, key: K, value: V, guard: &Guard) -> RefEntry<K, V> {
+        self.core.insert_internal(key, value, false, guard)
+    }
+
+    // /// Returns an iterator over all entries in the skip list.
+    // pub fn iter<'g>(&self, guard: &'g Guard) -> Iter<'g, K, V> {
+    //     self.check_guard(guard);
+    //     Iter {
+    //         parent: self,
+    //         head: None,
+    //         tail: None,
+    //         guard,
+    //     }
+    // }
+
+    // /// Returns an iterator over all entries in the skip list.
+    // pub fn ref_iter(&self) -> RefIter<K, V> {
+    //     RefIter {
+    //         parent: self,
+    //         head: None,
+    //         tail: None,
+    //     }
+    // }
+
+    // /// Returns an iterator over a subset of entries in the skip list.
+    // pub fn range<'g, 'k, Min, Max>(
+    //     &self,
+    //     lower_bound: Bound<&'k Min>,
+    //     upper_bound: Bound<&'k Max>,
+    //     guard: &'g Guard,
+    // ) -> Range<'g, 'k, Min, Max, K, V>
+    // where
+    //     K: Ord + Borrow<Min> + Borrow<Max>,
+    //     Min: Ord + ?Sized + 'k,
+    //     Max: Ord + ?Sized + 'k,
+    // {
+    //     self.check_guard(guard);
+    //     Range {
+    //         parent: self,
+    //         head: None,
+    //         tail: None,
+    //         lower_bound,
+    //         upper_bound,
+    //         guard,
+    //     }
+    // }
+
+    // /// Returns an iterator over a subset of entries in the skip list.
+    // pub fn ref_range<'a, 'k, Min, Max>(
+    //     &'a self,
+    //     lower_bound: Bound<&'k Min>,
+    //     upper_bound: Bound<&'k Max>,
+    // ) -> RefRange<'a, 'k, Min, Max, K, V>
+    // where
+    //     K: Ord + Borrow<Min> + Borrow<Max>,
+    //     Min: Ord + ?Sized + 'k,
+    //     Max: Ord + ?Sized + 'k,
+    // {
+    //     RefRange {
+    //         parent: self,
+    //         head: None,
+    //         tail: None,
+    //         lower_bound,
+    //         upper_bound,
+    //     }
+    // }
+}
+
+impl<K, V> SkipListWrap<K, V>
+where
+    K: Ord + Send + 'static,
+    V: Send + 'static,
+{
+    /// Iterates over the map and removes every entry.
+    pub fn clear(&self, guard: &mut Guard) {
+        self.core.check_guard(guard);
+
+        /// Number of steps after which we repin the current thread and unlink removed nodes.
+        const BATCH_SIZE: usize = 100;
+
+        loop {
+            {
+                // Search for the first entry in order to unlink all the preceeding entries
+                // we have removed.
+                //
+                // By unlinking nodes in batches we make sure that the final search doesn't
+                // unlink all nodes at once, which could keep the current thread pinned for a
+                // long time.
+                let mut entry = self.lower_bound(Bound::Unbounded, guard);
+
+                for _ in 0..BATCH_SIZE {
+                    // Stop if we have reached the end of the list.
+                    let e = match entry {
+                        None => return,
+                        Some(e) => e,
+                    };
+
+                    // Before removing the current entry, first obtain the following one.
+                    let next = e.next();
+
+                    // Try removing the current entry.
+                    if e.node.mark_tower() {
+                        // Success! Decrement `len`.
+                        self.core.hot_data.len.fetch_sub(1, Ordering::Relaxed);
+                    }
+
+                    entry = next;
+                }
+            }
+
+            // Repin the current thread because we don't want to keep it pinned in the same
+            // epoch for a too long time.
+            guard.repin();
+        }
+    }
+}
+
 impl<K, V> SkipList<K, V>
 where
     K: Ord + Send + 'static,
@@ -1087,75 +1211,6 @@ where
             }
         }
     }
-
-    /// Removes an entry from the front of the skip list.
-    pub fn pop_front(&self, guard: &Guard) -> Option<RefEntry<K, V>> {
-        self.check_guard(guard);
-        loop {
-            let e = self.front(guard)?;
-            if let Some(e) = e.pin() {
-                if e.remove(guard) {
-                    return Some(e);
-                }
-            }
-        }
-    }
-
-    /// Removes an entry from the back of the skip list.
-    pub fn pop_back(&self, guard: &Guard) -> Option<RefEntry<K, V>> {
-        self.check_guard(guard);
-        loop {
-            let e = self.back(guard)?;
-            if let Some(e) = e.pin() {
-                if e.remove(guard) {
-                    return Some(e);
-                }
-            }
-        }
-    }
-
-    /// Iterates over the map and removes every entry.
-    pub fn clear(&self, guard: &mut Guard) {
-        self.check_guard(guard);
-
-        /// Number of steps after which we repin the current thread and unlink removed nodes.
-        const BATCH_SIZE: usize = 100;
-
-        loop {
-            {
-                // Search for the first entry in order to unlink all the preceeding entries
-                // we have removed.
-                //
-                // By unlinking nodes in batches we make sure that the final search doesn't
-                // unlink all nodes at once, which could keep the current thread pinned for a
-                // long time.
-                let mut entry = self.lower_bound(Bound::Unbounded, guard);
-
-                for _ in 0..BATCH_SIZE {
-                    // Stop if we have reached the end of the list.
-                    let e = match entry {
-                        None => return,
-                        Some(e) => e,
-                    };
-
-                    // Before removing the current entry, first obtain the following one.
-                    let next = e.next();
-
-                    // Try removing the current entry.
-                    if e.node.mark_tower() {
-                        // Success! Decrement `len`.
-                        self.hot_data.len.fetch_sub(1, Ordering::Relaxed);
-                    }
-
-                    entry = next;
-                }
-            }
-
-            // Repin the current thread because we don't want to keep it pinned in the same
-            // epoch for a too long time.
-            guard.repin();
-        }
-    }
 }
 
 impl<K, V> Drop for SkipList<K, V> {
@@ -1213,13 +1268,13 @@ impl<K, V> IntoIterator for SkipList<K, V> {
 /// The lifetimes of the key and value are the same as that of the `Guard`
 /// used when creating the `Entry` (`'g`). This lifetime is also constrained to
 /// not outlive the `SkipList`.
-pub struct Entry<'a: 'g, 'g, K: 'a, V: 'a> {
-    parent: &'a SkipList<K, V>,
+pub struct Entry<'g, K, V> {
+    parent: SkipListWrap<K, V>,
     node: &'g Node<K, V>,
     guard: &'g Guard,
 }
 
-impl<'a: 'g, 'g, K: 'a, V: 'a> Entry<'a, 'g, K, V> {
+impl<'g, K, V> Entry<'g, K, V> {
     /// Returns `true` if the entry is removed from the skip list.
     pub fn is_removed(&self) -> bool {
         self.node.is_removed()
@@ -1236,47 +1291,22 @@ impl<'a: 'g, 'g, K: 'a, V: 'a> Entry<'a, 'g, K, V> {
     }
 
     /// Returns a reference to the parent `SkipList`
-    pub fn skiplist(&self) -> &'a SkipList<K, V> {
+    pub fn skiplist(&self) -> SkipListWrap<K, V> {
         self.parent
     }
 
-    /// Attempts to pin the entry with a reference count, ensuring that it
-    /// remains accessible even after the `Guard` is dropped.
-    ///
-    /// This method may return `None` if the reference count is already 0 and
-    /// the node has been queued for deletion.
-    pub fn pin(&self) -> Option<RefEntry<'a, K, V>> {
-        unsafe { RefEntry::try_acquire(self.parent, self.node) }
-    }
+    // /// Attempts to pin the entry with a reference count, ensuring that it
+    // /// remains accessible even after the `Guard` is dropped.
+    // ///
+    // /// This method may return `None` if the reference count is already 0 and
+    // /// the node has been queued for deletion.
+    // pub fn pin(&self) -> Option<RefEntry<'a, K, V>> {
+    //     unsafe { RefEntry::try_acquire(self.parent, self.node) }
+    // }
 }
 
-impl<'a: 'g, 'g, K, V> Entry<'a, 'g, K, V>
-where
-    K: Ord + Send + 'static,
-    V: Send + 'static,
-{
-    /// Removes the entry from the skip list.
-    ///
-    /// Returns `true` if this call removed the entry and `false` if it was already removed.
-    pub fn remove(&self) -> bool {
-        // Try marking the tower.
-        if self.node.mark_tower() {
-            // Success - the entry is removed. Now decrement `len`.
-            self.parent.hot_data.len.fetch_sub(1, Ordering::Relaxed);
-
-            // Search for the key to unlink the node from the skip list.
-            self.parent
-                .search_bound(Bound::Included(&self.node.key), false, self.guard);
-
-            true
-        } else {
-            false
-        }
-    }
-}
-
-impl<'a: 'g, 'g, K, V> Clone for Entry<'a, 'g, K, V> {
-    fn clone(&self) -> Entry<'a, 'g, K, V> {
+impl<'g, K, V> Clone for Entry<'g, K, V> {
+    fn clone(&self) -> Entry<'g, K, V> {
         Entry {
             parent: self.parent,
             node: self.node,
@@ -1285,7 +1315,7 @@ impl<'a: 'g, 'g, K, V> Clone for Entry<'a, 'g, K, V> {
     }
 }
 
-impl<'a, 'g, K, V> fmt::Debug for Entry<'a, 'g, K, V>
+impl<'g, K, V> fmt::Debug for Entry<'g, K, V>
 where
     K: fmt::Debug,
     V: fmt::Debug,
@@ -1298,7 +1328,7 @@ where
     }
 }
 
-impl<'a: 'g, 'g, K, V> Entry<'a, 'g, K, V>
+impl<'g, K, V> Entry<'g, K, V>
 where
     K: Ord,
 {
@@ -1314,8 +1344,8 @@ where
     }
 
     /// Returns the next entry in the skip list.
-    pub fn next(&self) -> Option<Entry<'a, 'g, K, V>> {
-        let n = self.parent.next_node(
+    pub fn next(&self) -> Option<Entry<'g, K, V>> {
+        let n = self.parent.core.next_node(
             &self.node.tower,
             Bound::Excluded(&self.node.key),
             self.guard,
@@ -1339,8 +1369,10 @@ where
     }
 
     /// Returns the previous entry in the skip list.
-    pub fn prev(&self) -> Option<Entry<'a, 'g, K, V>> {
-        let n = self.parent
+    pub fn prev(&self) -> Option<Entry<'g, K, V>> {
+        let n = self
+            .parent
+            .core
             .search_bound(Bound::Excluded(&self.node.key), true, self.guard)?;
         Some(Entry {
             parent: self.parent,
@@ -1354,12 +1386,12 @@ where
 ///
 /// You *must* call `release` to free this type, otherwise the node will be
 /// leaked. This is because releasing the entry requires a `Guard`.
-pub struct RefEntry<'a, K: 'a, V: 'a> {
+pub struct RefEntry<'a, K, V> {
     parent: &'a SkipList<K, V>,
     node: &'a Node<K, V>,
 }
 
-impl<'a, K: 'a, V: 'a> RefEntry<'a, K, V> {
+impl<'a, K, V> RefEntry<'a, K, V> {
     /// Returns `true` if the entry is removed from the skip list.
     pub fn is_removed(&self) -> bool {
         self.node.is_removed()
@@ -1474,7 +1506,8 @@ where
         unsafe {
             let mut n = self.node;
             loop {
-                n = self.parent
+                n = self
+                    .parent
                     .next_node(&n.tower, Bound::Excluded(&n.key), guard)?;
                 if let Some(e) = RefEntry::try_acquire(self.parent, n) {
                     return Some(e);
@@ -1499,7 +1532,8 @@ where
         unsafe {
             let mut n = self.node;
             loop {
-                n = self.parent
+                n = self
+                    .parent
                     .search_bound(Bound::Excluded(&n.key), true, guard)?;
                 if let Some(e) = RefEntry::try_acquire(self.parent, n) {
                     return Some(e);
@@ -1516,25 +1550,30 @@ where
 }
 
 /// An iterator over the entries of a `SkipList`.
-pub struct Iter<'a: 'g, 'g, K: 'a, V: 'a> {
-    parent: &'a SkipList<K, V>,
+pub struct Iter<'g, K, V> {
+    parent: SkipListWrap<K, V>,
     head: Option<&'g Node<K, V>>,
     tail: Option<&'g Node<K, V>>,
     guard: &'g Guard,
 }
 
-impl<'a: 'g, 'g, K: 'a, V: 'a> Iterator for Iter<'a, 'g, K, V>
+impl<'g, K, V> Iterator for Iter<'g, K, V>
 where
     K: Ord,
 {
-    type Item = Entry<'a, 'g, K, V>;
+    type Item = Entry<'g, K, V>;
 
-    fn next(&mut self) -> Option<Entry<'a, 'g, K, V>> {
+    fn next(&mut self) -> Option<Entry<'g, K, V>> {
         self.head = match self.head {
-            Some(n) => self.parent
+            Some(n) => self
+                .parent
+                .core
                 .next_node(&n.tower, Bound::Excluded(&n.key), self.guard),
-            None => self.parent
-                .next_node(&self.parent.head, Bound::Unbounded, self.guard),
+            None => {
+                self.parent
+                    .core
+                    .next_node(&self.parent.core.head, Bound::Unbounded, self.guard)
+            }
         };
         if let (Some(h), Some(t)) = (self.head, self.tail) {
             if h.key >= t.key {
@@ -1550,15 +1589,20 @@ where
     }
 }
 
-impl<'a: 'g, 'g, K: 'a, V: 'a> DoubleEndedIterator for Iter<'a, 'g, K, V>
+impl<'g, K, V> DoubleEndedIterator for Iter<'g, K, V>
 where
     K: Ord,
 {
-    fn next_back(&mut self) -> Option<Entry<'a, 'g, K, V>> {
+    fn next_back(&mut self) -> Option<Entry<'g, K, V>> {
         self.tail = match self.tail {
-            Some(n) => self.parent
+            Some(n) => self
+                .parent
+                .core
                 .search_bound(Bound::Excluded(&n.key), true, self.guard),
-            None => self.parent.search_bound(Bound::Unbounded, true, self.guard),
+            None => self
+                .parent
+                .core
+                .search_bound(Bound::Unbounded, true, self.guard),
         };
         if let (Some(h), Some(t)) = (self.head, self.tail) {
             if h.key >= t.key {
@@ -1575,63 +1619,63 @@ where
 }
 
 /// An iterator over reference-counted entries of a `SkipList`.
-pub struct RefIter<'a, K: 'a, V: 'a> {
+pub struct RefIter<'a, K, V> {
     parent: &'a SkipList<K, V>,
     head: Option<RefEntry<'a, K, V>>,
     tail: Option<RefEntry<'a, K, V>>,
 }
 
-impl<'a, K: 'a, V: 'a> RefIter<'a, K, V>
-where
-    K: Ord,
-{
-    pub fn next(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V>> {
-        self.parent.check_guard(guard);
-        self.head = match self.head {
-            Some(ref e) => e.next(guard),
-            None => try_pin_loop(|| self.parent.front(guard)),
-        };
-        let mut finished = false;
-        if let (&Some(ref h), &Some(ref t)) = (&self.head, &self.tail) {
-            if h.key() >= t.key() {
-                finished = true;
-            }
-        }
-        if finished {
-            self.head = None;
-            self.tail = None;
-        }
-        self.head.clone()
-    }
+// impl<'a, K, V> RefIter<'a, K, V>
+// where
+//     K: Ord,
+// {
+//     pub fn next(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V>> {
+//         self.parent.check_guard(guard);
+//         self.head = match self.head {
+//             Some(ref e) => e.next(guard),
+//             None => try_pin_loop(|| self.parent.front(guard)),
+//         };
+//         let mut finished = false;
+//         if let (&Some(ref h), &Some(ref t)) = (&self.head, &self.tail) {
+//             if h.key() >= t.key() {
+//                 finished = true;
+//             }
+//         }
+//         if finished {
+//             self.head = None;
+//             self.tail = None;
+//         }
+//         self.head.clone()
+//     }
 
-    pub fn next_back(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V>> {
-        self.parent.check_guard(guard);
-        self.tail = match self.tail {
-            Some(ref e) => e.prev(guard),
-            None => try_pin_loop(|| self.parent.back(guard)),
-        };
-        let mut finished = false;
-        if let (&Some(ref h), &Some(ref t)) = (&self.head, &self.tail) {
-            if h.key() >= t.key() {
-                finished = true;
-            }
-        }
-        if finished {
-            self.head = None;
-            self.tail = None;
-        }
-        self.tail.clone()
-    }
-}
+//     pub fn next_back(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V>> {
+//         self.parent.check_guard(guard);
+//         self.tail = match self.tail {
+//             Some(ref e) => e.prev(guard),
+//             None => try_pin_loop(|| self.parent.back(guard)),
+//         };
+//         let mut finished = false;
+//         if let (&Some(ref h), &Some(ref t)) = (&self.head, &self.tail) {
+//             if h.key() >= t.key() {
+//                 finished = true;
+//             }
+//         }
+//         if finished {
+//             self.head = None;
+//             self.tail = None;
+//         }
+//         self.tail.clone()
+//     }
+// }
 
 /// An iterator over a subset of entries of a `SkipList`.
-pub struct Range<'a: 'g, 'g, 'k, Min, Max, K: 'a, V: 'a>
+pub struct Range<'g, 'k, Min, Max, K, V>
 where
     K: Ord + Borrow<Min> + Borrow<Max>,
     Min: Ord + ?Sized + 'k,
     Max: Ord + ?Sized + 'k,
 {
-    parent: &'a SkipList<K, V>,
+    parent: SkipListWrap<K, V>,
     lower_bound: Bound<&'k Min>,
     upper_bound: Bound<&'k Max>,
     head: Option<&'g Node<K, V>>,
@@ -1639,19 +1683,23 @@ where
     guard: &'g Guard,
 }
 
-impl<'a: 'g, 'g, 'k, Min, Max, K: 'a, V: 'a> Iterator for Range<'a, 'g, 'k, Min, Max, K, V>
+impl<'g, 'k, Min, Max, K, V> Iterator for Range<'g, 'k, Min, Max, K, V>
 where
     K: Ord + Borrow<Min> + Borrow<Max>,
     Min: Ord + ?Sized + 'k,
     Max: Ord + ?Sized + 'k,
 {
-    type Item = Entry<'a, 'g, K, V>;
+    type Item = Entry<'g, K, V>;
 
-    fn next(&mut self) -> Option<Entry<'a, 'g, K, V>> {
+    fn next(&mut self) -> Option<Entry<'g, K, V>> {
         self.head = match self.head {
-            Some(n) => self.parent
+            Some(n) => self
+                .parent
+                .core
                 .next_node(&n.tower, Bound::Excluded(&n.key), self.guard),
-            None => self.parent
+            None => self
+                .parent
+                .core
                 .search_bound(self.lower_bound, false, self.guard),
         };
         if let Some(h) = self.head {
@@ -1672,39 +1720,39 @@ where
     }
 }
 
-impl<'a: 'g, 'g, 'k, Min, Max, K: 'a, V: 'a> DoubleEndedIterator
-    for Range<'a, 'g, 'k, Min, Max, K, V>
-where
-    K: Ord + Borrow<Min> + Borrow<Max>,
-    Min: Ord + ?Sized + 'k,
-    Max: Ord + ?Sized + 'k,
-{
-    fn next_back(&mut self) -> Option<Entry<'a, 'g, K, V>> {
-        self.tail = match self.tail {
-            Some(n) => self.parent
-                .search_bound(Bound::Excluded(&n.key), true, self.guard),
-            None => self.parent.search_bound(self.upper_bound, true, self.guard),
-        };
-        if let Some(t) = self.tail {
-            let bound = match self.head {
-                Some(h) => Bound::Excluded(h.key.borrow()),
-                None => self.lower_bound,
-            };
-            if !above_lower_bound(&bound, t.key.borrow()) {
-                self.head = None;
-                self.tail = None;
-            }
-        }
-        self.tail.map(|n| Entry {
-            parent: self.parent,
-            node: n,
-            guard: self.guard,
-        })
-    }
-}
+// impl<'g, 'k, Min, Max, K, V> DoubleEndedIterator for Range<'g, 'k, Min, Max, K, V>
+// where
+//     K: Ord + Borrow<Min> + Borrow<Max>,
+//     Min: Ord + ?Sized + 'k,
+//     Max: Ord + ?Sized + 'k,
+// {
+//     fn next_back(&mut self) -> Option<Entry<'g, K, V>> {
+//         self.tail = match self.tail {
+//             Some(n) => self
+//                 .parent
+//                 .search_bound(Bound::Excluded(&n.key), true, self.guard),
+//             None => self.parent.search_bound(self.upper_bound, true, self.guard),
+//         };
+//         if let Some(t) = self.tail {
+//             let bound = match self.head {
+//                 Some(h) => Bound::Excluded(h.key.borrow()),
+//                 None => self.lower_bound,
+//             };
+//             if !above_lower_bound(&bound, t.key.borrow()) {
+//                 self.head = None;
+//                 self.tail = None;
+//             }
+//         }
+//         self.tail.map(|n| Entry {
+//             parent: self.parent,
+//             node: n,
+//             guard: self.guard,
+//         })
+//     }
+// }
 
 /// An iterator over reference-counted subset of entries of a `SkipList`.
-pub struct RefRange<'a, 'k, Min, Max, K: 'a, V: 'a>
+pub struct RefRange<'a, 'k, Min, Max, K, V>
 where
     K: Ord + Borrow<Min> + Borrow<Max>,
     Min: Ord + ?Sized + 'k,
@@ -1717,58 +1765,58 @@ where
     tail: Option<RefEntry<'a, K, V>>,
 }
 
-impl<'a, 'k, Min, Max, K: 'a, V: 'a> RefRange<'a, 'k, Min, Max, K, V>
-where
-    K: Ord + Borrow<Min> + Borrow<Max>,
-    Min: Ord + ?Sized + 'k,
-    Max: Ord + ?Sized + 'k,
-{
-    pub fn next(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V>> {
-        self.parent.check_guard(guard);
-        self.head = match self.head {
-            Some(ref e) => e.next(guard),
-            None => try_pin_loop(|| self.parent.lower_bound(self.lower_bound, guard)),
-        };
-        let mut finished = false;
-        if let Some(ref h) = self.head {
-            let bound = match self.tail {
-                Some(ref t) => Bound::Excluded(t.key().borrow()),
-                None => self.upper_bound,
-            };
-            if !below_upper_bound(&bound, h.key().borrow()) {
-                finished = true;
-            }
-        }
-        if finished {
-            self.head = None;
-            self.tail = None;
-        }
-        self.head.clone()
-    }
+// impl<'a, 'k, Min, Max, K, V> RefRange<'a, 'k, Min, Max, K, V>
+// where
+//     K: Ord + Borrow<Min> + Borrow<Max>,
+//     Min: Ord + ?Sized + 'k,
+//     Max: Ord + ?Sized + 'k,
+// {
+//     pub fn next(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V>> {
+//         self.parent.check_guard(guard);
+//         self.head = match self.head {
+//             Some(ref e) => e.next(guard),
+//             None => try_pin_loop(|| self.parent.lower_bound(self.lower_bound, guard)),
+//         };
+//         let mut finished = false;
+//         if let Some(ref h) = self.head {
+//             let bound = match self.tail {
+//                 Some(ref t) => Bound::Excluded(t.key().borrow()),
+//                 None => self.upper_bound,
+//             };
+//             if !below_upper_bound(&bound, h.key().borrow()) {
+//                 finished = true;
+//             }
+//         }
+//         if finished {
+//             self.head = None;
+//             self.tail = None;
+//         }
+//         self.head.clone()
+//     }
 
-    pub fn next_back(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V>> {
-        self.parent.check_guard(guard);
-        self.tail = match self.tail {
-            Some(ref e) => e.prev(guard),
-            None => try_pin_loop(|| self.parent.upper_bound(self.upper_bound, guard)),
-        };
-        let mut finished = false;
-        if let Some(ref t) = self.tail {
-            let bound = match self.head {
-                Some(ref h) => Bound::Excluded(h.key().borrow()),
-                None => self.lower_bound,
-            };
-            if !above_lower_bound(&bound, t.key().borrow()) {
-                finished = true;
-            }
-        }
-        if finished {
-            self.head = None;
-            self.tail = None;
-        }
-        self.tail.clone()
-    }
-}
+//     pub fn next_back(&mut self, guard: &Guard) -> Option<RefEntry<'a, K, V>> {
+//         self.parent.check_guard(guard);
+//         self.tail = match self.tail {
+//             Some(ref e) => e.prev(guard),
+//             None => try_pin_loop(|| self.parent.upper_bound(self.upper_bound, guard)),
+//         };
+//         let mut finished = false;
+//         if let Some(ref t) = self.tail {
+//             let bound = match self.head {
+//                 Some(ref h) => Bound::Excluded(h.key().borrow()),
+//                 None => self.lower_bound,
+//             };
+//             if !above_lower_bound(&bound, t.key().borrow()) {
+//                 finished = true;
+//             }
+//         }
+//         if finished {
+//             self.head = None;
+//             self.tail = None;
+//         }
+//         self.tail.clone()
+//     }
+// }
 
 /// An owning iterator over the entries of a `SkipList`.
 pub struct IntoIter<K, V> {
@@ -1836,13 +1884,14 @@ impl<K, V> Iterator for IntoIter<K, V> {
 /// returned.
 pub(crate) fn try_pin_loop<'a: 'g, 'g, F, K, V>(mut f: F) -> Option<RefEntry<'a, K, V>>
 where
-    F: FnMut() -> Option<Entry<'a, 'g, K, V>>,
+    F: FnMut() -> Option<Entry<'g, K, V>>,
 {
-    loop {
-        if let Some(e) = f()?.pin() {
-            return Some(e);
-        }
-    }
+    unimplemented!();
+    // loop {
+    //     if let Some(e) = f()?.pin() {
+    //         return Some(e);
+    //     }
+    // }
 }
 
 /// Helper function to check if a value is above a lower bound

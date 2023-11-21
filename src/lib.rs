@@ -32,6 +32,7 @@ pub use base::SkipList;
 pub use map::SkipMap;
 #[cfg(feature = "use_std")]
 pub use set::SkipSet;
+pub mod keys;
 
 /// An endpoint of a range of keys.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]

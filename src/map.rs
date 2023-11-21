@@ -39,14 +39,16 @@ where
 {
     /// Returns the entry with the smallest key.
     pub fn front(&self) -> Option<Entry<K, V>> {
-        let guard = &epoch::pin();
-        try_pin_loop(|| self.inner.front(guard)).map(Entry::new)
+        unimplemented!();
+        // let guard = &epoch::pin();
+        // try_pin_loop(|| self.inner.front(guard)).map(Entry::new)
     }
 
     /// Returns the entry with the largest key.
     pub fn back(&self) -> Option<Entry<K, V>> {
-        let guard = &epoch::pin();
-        try_pin_loop(|| self.inner.back(guard)).map(Entry::new)
+        unimplemented!();
+        // let guard = &epoch::pin();
+        // try_pin_loop(|| self.inner.back(guard)).map(Entry::new)
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -55,8 +57,9 @@ where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let guard = &epoch::pin();
-        self.inner.contains_key(key, guard)
+        unimplemented!();
+        // let guard = &epoch::pin();
+        // self.inner.contains_key(key, guard)
     }
 
     /// Returns an entry with the specified `key`.
@@ -65,8 +68,9 @@ where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let guard = &epoch::pin();
-        try_pin_loop(|| self.inner.get(key, guard)).map(Entry::new)
+        unimplemented!();
+        // let guard = &epoch::pin();
+        // try_pin_loop(|| self.inner.get(key, guard)).map(Entry::new)
     }
 
     /// Returns an `Entry` pointing to the lowest element whose key is above
@@ -77,8 +81,9 @@ where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let guard = &epoch::pin();
-        try_pin_loop(|| self.inner.lower_bound(bound, guard)).map(Entry::new)
+        unimplemented!();
+        // let guard = &epoch::pin();
+        // try_pin_loop(|| self.inner.lower_bound(bound, guard)).map(Entry::new)
     }
 
     /// Returns an `Entry` pointing to the highest element whose key is below
@@ -89,21 +94,24 @@ where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let guard = &epoch::pin();
-        try_pin_loop(|| self.inner.upper_bound(bound, guard)).map(Entry::new)
+        unimplemented!();
+        // let guard = &epoch::pin();
+        // try_pin_loop(|| self.inner.upper_bound(bound, guard)).map(Entry::new)
     }
 
     /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist.
     pub fn get_or_insert(&self, key: K, value: V) -> Entry<K, V> {
-        let guard = &epoch::pin();
-        Entry::new(self.inner.get_or_insert(key, value, guard))
+        unimplemented!();
+        // let guard = &epoch::pin();
+        // Entry::new(self.inner.get_or_insert(key, value, guard))
     }
 
     /// Returns an iterator over all entries in the map.
     pub fn iter(&self) -> Iter<K, V> {
-        Iter {
-            inner: self.inner.ref_iter(),
-        }
+        unimplemented!();
+        // Iter {
+        //     inner: self.inner.ref_iter(),
+        // }
     }
 
     /// Returns an iterator over a subset of entries in the skip list.
@@ -117,9 +125,10 @@ where
         Min: Ord + ?Sized + 'k,
         Max: Ord + ?Sized + 'k,
     {
-        Range {
-            inner: self.inner.ref_range(lower_bound, upper_bound),
-        }
+        unimplemented!();
+        // Range {
+        //     inner: self.inner.ref_range(lower_bound, upper_bound),
+        // }
     }
 }
 
@@ -149,20 +158,23 @@ where
 
     /// Removes an entry from the front of the map.
     pub fn pop_front(&self) -> Option<Entry<K, V>> {
-        let guard = &epoch::pin();
-        self.inner.pop_front(guard).map(Entry::new)
+        unimplemented!();
+        // let guard = &epoch::pin();
+        // self.inner.pop_front(guard).map(Entry::new)
     }
 
     /// Removes an entry from the back of the map.
     pub fn pop_back(&self) -> Option<Entry<K, V>> {
-        let guard = &epoch::pin();
-        self.inner.pop_back(guard).map(Entry::new)
+        unimplemented!();
+        // let guard = &epoch::pin();
+        // self.inner.pop_back(guard).map(Entry::new)
     }
 
     /// Iterates over the map and removes every entry.
     pub fn clear(&self) {
-        let guard = &mut epoch::pin();
-        self.inner.clear(guard);
+        unimplemented!();
+        // let guard = &mut epoch::pin();
+        // self.inner.clear(guard);
     }
 }
 
@@ -328,8 +340,7 @@ impl<K, V> Iterator for IntoIter<K, V> {
     }
 }
 
-impl<K, V> fmt::Debug for IntoIter<K, V>
-{
+impl<K, V> fmt::Debug for IntoIter<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "IntoIter {{ ... }}")
     }
@@ -347,8 +358,9 @@ where
     type Item = Entry<'a, K, V>;
 
     fn next(&mut self) -> Option<Entry<'a, K, V>> {
-        let guard = &epoch::pin();
-        self.inner.next(guard).map(Entry::new)
+        unimplemented!();
+        // let guard = &epoch::pin();
+        // self.inner.next(guard).map(Entry::new)
     }
 }
 
@@ -357,13 +369,13 @@ where
     K: Ord,
 {
     fn next_back(&mut self) -> Option<Entry<'a, K, V>> {
-        let guard = &epoch::pin();
-        self.inner.next_back(guard).map(Entry::new)
+        unimplemented!();
+        // let guard = &epoch::pin();
+        // self.inner.next_back(guard).map(Entry::new)
     }
 }
 
-impl<'a, K, V> fmt::Debug for Iter<'a, K, V>
-{
+impl<'a, K, V> fmt::Debug for Iter<'a, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Iter {{ ... }}")
     }
@@ -388,8 +400,9 @@ where
     type Item = Entry<'a, K, V>;
 
     fn next(&mut self) -> Option<Entry<'a, K, V>> {
-        let guard = &epoch::pin();
-        self.inner.next(guard).map(Entry::new)
+        unimplemented!();
+        // let guard = &epoch::pin();
+        // self.inner.next(guard).map(Entry::new)
     }
 }
 
@@ -400,8 +413,9 @@ where
     Max: Ord + ?Sized + 'k,
 {
     fn next_back(&mut self) -> Option<Entry<'a, K, V>> {
-        let guard = &epoch::pin();
-        self.inner.next_back(guard).map(Entry::new)
+        unimplemented!();
+        // let guard = &epoch::pin();
+        // self.inner.next_back(guard).map(Entry::new)
     }
 }
 
@@ -673,6 +687,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![]
         );
+    }
+
+    use std::sync::Arc;
+    #[test]
+    fn test_x() {
+        use Bound::*;
+        let s = Arc::new(SkipMap::new());
+
+        let mut i = 0;
+        while i < 1000 {
+            s.insert(i, i);
+            i += 2;
+        }
+
+        let s1 = s.clone();
+        let h1 = std::thread::spawn(move || {
+            let mut i = 1;
+            while i < 1000 {
+                s1.insert(i, i);
+                i += 2;
+            }
+        });
+
+        let s2 = s.clone();
+        let h2 = std::thread::spawn(move || {
+            let mut i = 0;
+            while i < 1000 {
+                s2.remove(&i);
+                i += 2;
+            }
+        });
+
+        let _ = h1.join();
+        let _ = h2.join();
+
+        let mut iter = s.iter();
+        let mut count = 0;
+        while let Some(e) = iter.next() {
+            println!("{} {}", e.key(), e.value());
+            count += 1;
+        }
+        println!("\n{}", count);
     }
 
     // TODO(stjepang): Write more tests.
